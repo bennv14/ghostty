@@ -1168,7 +1168,24 @@ extension Ghostty {
             // Some input methods keep the current word marked until a delimiter
             // commits it. When preedit is streamed to the PTY, insertText has
             // already reconciled the committed value.
-            if let committedText = streamedPreeditCommitInKeyDown {
+            if var committedText = streamedPreeditCommitInKeyDown {
+                if let list = keyTextAccumulator, list.count > 0 {
+                    for text in list {
+                        // We were composing (streamed preedit just committed),
+                        // so C0 controls in the accumulator belong to the IME.
+                        // Suppress them here; keys like enter are replayed as
+                        // proper key events below instead.
+                        if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                            text,
+                            composing: true
+                        ) {
+                            continue
+                        }
+                        _ = committedPreeditTextAction(action, text: text)
+                        committedText += text
+                    }
+                }
+
                 if Self.shouldReplayStreamedPreeditCommitKey(
                     Ghostty.Input.Key(keyCode: translationEvent.keyCode),
                     text: translationEvent.ghosttyCharacters,
@@ -2160,7 +2177,9 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         }
 
         switch key {
-        case .arrowDown, .arrowLeft, .arrowRight, .arrowUp, .enter, .space, .tab:
+        case .arrowDown, .arrowLeft, .arrowRight, .arrowUp, .delete, .end,
+             .enter, .escape, .home, .numpadEnter, .pageDown, .pageUp,
+             .space, .tab:
             return true
         default:
             break

@@ -72,9 +72,16 @@ struct SurfaceViewAppKitTests {
         (Ghostty.Input.Key.space, " ", "tiếng", true),
         (Ghostty.Input.Key.enter, "\r", "tiếng", true),
         (Ghostty.Input.Key.arrowLeft, nil, "tiếng", true),
+        (Ghostty.Input.Key.home, nil, "tiếng", true),
+        (Ghostty.Input.Key.pageDown, nil, "tiếng", true),
+        (Ghostty.Input.Key.escape, "\u{1b}", "tiếng", true),
         (Ghostty.Input.Key.slash, "/", "tiếng", true),
         (Ghostty.Input.Key.s, "s", "tiếng", false),
         (Ghostty.Input.Key.space, " ", "tiếng ", false),
+        // Digits committed by the IME arrive via insertText and are
+        // reconciled into committedText; never replay them as keys.
+        (Ghostty.Input.Key.digit1, "1", "tiếng", false),
+        (Ghostty.Input.Key.digit1, "1", "tiếng1", false),
     ])
     func replaysOnlyStreamedPreeditCommitDelimiter(
         key: Ghostty.Input.Key,
