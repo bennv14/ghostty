@@ -192,6 +192,8 @@ extension Ghostty {
         var notificationIdentifiers: Set<String> = []
 
         private var markedText: NSMutableAttributedString
+        private var streamedPreeditText: String = ""
+        private var streamedPreeditCommitInKeyDown: String?
         private(set) var focused: Bool = true
         private var prevPressureStage: Int = 0
         private var appearanceObserver: NSKeyValueObservation?
@@ -468,6 +470,15 @@ extension Ghostty {
 
                 // We unset our bell state if we gained focus
                 bell = false
+
+                // If we somehow regained focus with stale streamed preedit
+                // (e.g. an app switch ended composition without notifying us),
+                // finalize it in place rather than deleting it on the next key.
+                if !streamedPreeditText.isEmpty {
+                    markedText.mutableString.setString("")
+                    streamedPreeditText = ""
+                    inputContext?.discardMarkedText()
+                }
 
                 // Remove any notifications for this surface once we gain focus.
                 if !notificationIdentifiers.isEmpty {
@@ -1175,7 +1186,10 @@ extension Ghostty {
             // we call interpretKeyEvents so that we can handle complex input such as Korean
             // language.
             keyTextAccumulator = []
-            defer { keyTextAccumulator = nil }
+            defer {
+                keyTextAccumulator = nil
+                streamedPreeditCommitInKeyDown = nil
+            }
 
             // We need to know what the length of marked text was before this event to
             // know if these events cleared it.
@@ -1207,6 +1221,44 @@ extension Ghostty {
             // do this and the key event callbacks below doesn't matter since
             // we control the preedit state only through the preedit API.
             syncPreedit(clearIfNeeded: markedTextBefore)
+
+            // Some input methods keep the current word marked until a delimiter
+            // commits it. When preedit is streamed to the PTY, insertText has
+            // already reconciled the committed value.
+            if var committedText = streamedPreeditCommitInKeyDown {
+                if let list = keyTextAccumulator, list.count > 0 {
+                    for text in list {
+                        // We were composing (streamed preedit just committed),
+                        // so C0 controls in the accumulator belong to the IME.
+                        // Suppress them here; keys like enter are replayed as
+                        // proper key events below instead.
+                        if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                            text,
+                            composing: true
+                        ) {
+                            continue
+                        }
+                        _ = committedTextAction(action, text: text)
+                        committedText += text
+                    }
+                }
+
+                if Self.shouldReplayStreamedPreeditCommitKey(
+                    Ghostty.Input.Key(keyCode: translationEvent.keyCode),
+                    text: translationEvent.ghosttyCharacters,
+                    committedText: committedText,
+                    modifiers: translationEvent.modifierFlags
+                ) {
+                    _ = keyAction(
+                        action,
+                        event: event,
+                        translationEvent: translationEvent,
+                        text: translationEvent.ghosttyCharacters,
+                        composing: false
+                    )
+                }
+                return
+            }
 
             // We're composing if we have preedit (the obvious case). But we're also
             // composing if we don't have preedit and we had marked text before,
@@ -1991,6 +2043,21 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     }
 
     func unmarkText() {
+        // Streamed preedit is already in the terminal; unmarking commits it
+        // in place rather than deleting it with backspaces.
+        if !streamedPreeditText.isEmpty ||
+            (markedText.length > 0 && KeyboardLayout.preeditStrategy == .streamToTerminal) {
+            if markedText.length > 0 {
+                streamMarkedText(markedText.string)
+            }
+            markedText.mutableString.setString("")
+            streamedPreeditText = ""
+            if let surface {
+                ghostty_surface_preedit(surface, nil, 0)
+            }
+            return
+        }
+
         if self.markedText.length > 0 {
             self.markedText.mutableString.setString("")
             syncPreedit()
@@ -2098,8 +2165,11 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {
-        // We must have an associated event
-        guard NSApp.currentEvent != nil else { return }
+        let hasCurrentEvent = NSApp.currentEvent != nil
+        // We must have an associated event unless we're reconciling an
+        // already-streamed preedit (e.g. AppKit committing marked text on
+        // focus loss or app deactivation).
+        guard hasCurrentEvent || !streamedPreeditText.isEmpty else { return }
 
         // We want the string view of the any value
         var chars = ""
@@ -2107,10 +2177,10 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         case let v as NSAttributedString:
             chars = v.string
         case let v as NSString:
-            if let leadSurrogate = LeadSurrogate(v) {
+            if hasCurrentEvent, let leadSurrogate = LeadSurrogate(v) {
                 self.leadSurrogate = leadSurrogate
                 chars = ""
-            } else if let trail = TrailSurrogate(v) {
+            } else if hasCurrentEvent, let trail = TrailSurrogate(v) {
                 // We ignore trail surrogate without a lead like Terminal.app.
                 chars = leadSurrogate?.encode(trail: trail) ?? ""
                 leadSurrogate = nil
@@ -2119,9 +2189,27 @@ extension Ghostty.SurfaceView: NSTextInputClient {
                 // Clear whenever other text got inserted.
                 // Ideally we should encode any adjacent lead and trail surrogate into one,
                 // but getting the cursor position and reading could be rather expensive to do.
-                leadSurrogate = nil
+                if hasCurrentEvent {
+                    leadSurrogate = nil
+                }
             }
         default:
+            return
+        }
+
+        // Streamed preedit has already been sent to the PTY. Reconcile the
+        // final committed value against it instead of sending it twice.
+        if !streamedPreeditText.isEmpty {
+            if !hasCurrentEvent && chars.isEmpty {
+                return
+            }
+            markedText.mutableString.setString("")
+            streamMarkedText(chars)
+            streamedPreeditText = ""
+
+            if keyTextAccumulator != nil {
+                streamedPreeditCommitInKeyDown = chars
+            }
             return
         }
 
@@ -2160,6 +2248,31 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     private func syncPreedit(clearIfNeeded: Bool = true) {
         guard let surface else { return }
 
+        let isActivelyFocused = focused && NSApp.isActive && (window?.isKeyWindow ?? false)
+        switch KeyboardLayout.preeditStrategy {
+        case .streamToTerminal:
+            // Outside keyDown while unfocused (e.g. app switch / deactivation),
+            // clearing markedText must not erase already-streamed text.
+            if !isActivelyFocused &&
+                keyTextAccumulator == nil &&
+                markedText.length == 0 &&
+                !streamedPreeditText.isEmpty {
+                streamedPreeditText = ""
+                ghostty_surface_preedit(surface, nil, 0)
+                return
+            }
+            streamMarkedText(markedText.string)
+            ghostty_surface_preedit(surface, nil, 0)
+            return
+        case .native:
+            if !streamedPreeditText.isEmpty {
+                if markedText.string.precomposedStringWithCanonicalMapping == streamedPreeditText {
+                    markedText.mutableString.setString("")
+                }
+                streamedPreeditText = ""
+            }
+        }
+
         if markedText.length > 0 {
             let str = markedText.string
             let len = str.utf8CString.count
@@ -2174,6 +2287,90 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             // in a preedit state so we can clear it.
             ghostty_surface_preedit(surface, nil, 0)
         }
+    }
+
+    struct PreeditDelta: Equatable {
+        let deleteCount: Int
+        let insertText: String
+    }
+
+    static func preeditDelta(from oldValue: String, to newValue: String) -> PreeditDelta {
+        let oldCharacters = Array(oldValue)
+        let newCharacters = Array(newValue)
+        let commonPrefixCount = zip(oldCharacters, newCharacters)
+            .prefix { $0 == $1 }
+            .count
+
+        return PreeditDelta(
+            deleteCount: oldCharacters.count - commonPrefixCount,
+            insertText: String(newCharacters.dropFirst(commonPrefixCount))
+        )
+    }
+
+    static func shouldReplayStreamedPreeditCommitKey(
+        _ key: Ghostty.Input.Key?,
+        text: String?,
+        committedText: String,
+        modifiers: NSEvent.ModifierFlags = []
+    ) -> Bool {
+        if !modifiers.isDisjoint(with: [.control, .command]) {
+            return true
+        }
+
+        if let text, !text.isEmpty, committedText.hasSuffix(text) {
+            return false
+        }
+
+        switch key {
+        case .arrowDown, .arrowLeft, .arrowRight, .arrowUp, .delete, .end,
+             .enter, .escape, .home, .numpadEnter, .pageDown, .pageUp,
+             .space, .tab,
+             .numpadUp, .numpadDown, .numpadLeft, .numpadRight,
+             .numpadHome, .numpadEnd, .numpadDelete,
+             .numpadPageUp, .numpadPageDown, .numpadInsert,
+             .numpadBackspace, .numpadClear,
+             .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10,
+             .f11, .f12, .f13, .f14, .f15, .f16, .f17, .f18, .f19,
+             .f20, .f21, .f22, .f23, .f24, .f25:
+            return true
+        default:
+            break
+        }
+
+        guard let text,
+              text.count == 1,
+              let scalar = text.unicodeScalars.first else {
+            return false
+        }
+        return !CharacterSet.alphanumerics.contains(scalar)
+    }
+
+    private func streamMarkedText(_ text: String) {
+        guard let surface,
+              let backspaceKeyCode = Ghostty.Input.Key.backspace.keyCode else {
+            return
+        }
+
+        let text = text.precomposedStringWithCanonicalMapping
+        let delta = Self.preeditDelta(from: streamedPreeditText, to: text)
+
+        for _ in 0..<delta.deleteCount {
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = GHOSTTY_ACTION_PRESS
+            keyEvent.keycode = UInt32(backspaceKeyCode)
+            keyEvent.mods = GHOSTTY_MODS_NONE
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+
+        if !delta.insertText.isEmpty {
+            _ = committedTextAction(
+                GHOSTTY_ACTION_PRESS,
+                text: delta.insertText
+            )
+        }
+
+        streamedPreeditText = text
     }
 
     /// True when `text` is a single C0 control character (U+0000-U+001F)
